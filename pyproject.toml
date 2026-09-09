@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cover-reminder"
+version = "0.1.0"
+description = "Hourly Instagram Reel cover checks with Telegram reminders"
+requires-python = ">=3.12"
+dependencies = ["Pillow==12.3.0"]
+
+[project.scripts]
+cover-reminder = "cover_reminder.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

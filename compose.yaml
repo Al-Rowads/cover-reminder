@@ -1,0 +1,29 @@
+services:
+  reminder:
+    build: .
+    init: true
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - reminder-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "python", "-m", "cover_reminder", "healthcheck"]
+      interval: 1m
+      timeout: 10s
+      start_period: 2m
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+volumes:
+  reminder-data:
