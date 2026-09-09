@@ -20,7 +20,9 @@ class LiveReadTests(unittest.TestCase):
         reel = instagram.get(reels[0].media_id)
         self.assertEqual(reel.media_id, reels[0].media_id)
         self.assertTrue(normalize_image(instagram.thumbnail(reel)))
-        self.assertTrue(Telegram(config, http).check().get("is_bot"))
+        telegram = Telegram(config, http)
+        self.assertTrue(telegram.check().get("is_bot"))
+        telegram.check_polling()
 
 
 if __name__ == "__main__":

@@ -3,6 +3,8 @@
 Checks one Instagram account's **Reels every hour**, using its existing Composio
 connection. Sends Telegram reminders **24 hours and 48 hours after publication**
 when no cover change has been confirmed. The 48-hour reminder is the final one.
+Reminders go to every active private-chat subscriber who has sent `/start` to the
+bot. No configured chat ID is needed. Send `/stop` to unsubscribe.
 
 ## Behavior
 
@@ -20,6 +22,15 @@ when no cover change has been confirmed. The 48-hour reminder is the final one.
 - After an outage that spans both deadlines, only the 48-hour reminder is sent.
 - Only Reels published after the **first successful activation** are eligible.
   Restarts preserve that activation time, post state, and the polling schedule.
+- Each reminder takes a snapshot of active subscribers when it is first queued.
+  New subscribers receive subsequent broadcasts, including upcoming reminders
+  for already monitored Reels. Broadcasts already queued or completed are not replayed.
+  With no subscribers, that milestone is skipped; the final milestone still
+  completes monitoring.
+- Delivery is tracked per recipient. One unreachable subscriber does not cause
+  repeat sends to everyone else. Blocking the bot or a forbidden delivery response
+  deactivates that subscriber; `/start` reactivates them for future broadcasts.
+  Unblocking alone does not resubscribe them.
 
 The API does not provide a documented cover-edit flag. An edit before the first
 check, a visually subtle edit, or a cached thumbnail can result in an unnecessary
@@ -28,12 +39,13 @@ does not publish posts or change covers.
 
 ## Set up on an always-on Docker server
 
-1. Create a Telegram bot with BotFather if needed, start its private chat, and
-   obtain that chat's numeric ID. An existing group destination also works if the
-   bot can send messages there. Use a dedicated destination for this monitor.
+1. Create a dedicated Telegram bot with BotFather if needed. Each recipient sends
+   `/start` in its private chat. Group commands are ignored. Use this worker as the
+   bot's only update consumer; an existing webhook or competing poller prevents
+   subscription collection and is reported as an error.
 2. Find the Composio project API key and the connected-account ID for your
    Instagram Business/Creator account in your Composio dashboard.
-3. Copy `.env.example` to `.env` and fill in the four empty credential/destination
+3. Copy `.env.example` to `.env` and fill in the four empty credential/connection
    fields. Keep `.env` private and out of Git. The pinned toolkit version is
    `20260819_00`; `INSTAGRAM_USER_ID=me` selects the connected Instagram account.
 4. Build and check the real connections:
@@ -45,8 +57,12 @@ does not publish posts or change covers.
    ```
 
 `check` reads Instagram media and checks the Telegram bot token. It prints recent
-Reel IDs for the next step. `send-test` sends a real notification to your configured
-destination and verifies delivery permission. No AI-model key is needed.
+Reel IDs for the next step. `send-test` collects pending subscriptions and sends a
+real notification to every active subscriber. It reports sent, failed, inactive,
+and unattempted counts. If nobody is subscribed, send `/start` and rerun it.
+Stop the worker before running `send-test`; both commands use the same exclusive
+lock. Repeating `send-test` intentionally sends another test notification.
+No AI-model key is needed.
 
 ### Verify that Instagram exposes cover edits
 
@@ -98,6 +114,15 @@ docker compose exec reminder python -m cover_reminder status
 The verification Reel predates activation and will not generate reminders.
 The container runs as a non-root user; SQLite, captures, and verification evidence
 live in the persistent `reminder-data` volume.
+The running worker collects subscriptions between hourly cover checks, using
+10-second Telegram long polling. `/start` and `/stop` receive confirmation messages.
+Registration is stored even if a confirmation message cannot be delivered.
+Before monitoring is verified and running, `send-test` can collect subscriptions.
+
+Telegram retains incoming updates for at most 24 hours. It does not provide a list
+of everyone who ever started a bot. Anyone whose previous `/start` update has
+expired or was consumed elsewhere must send `/start` again while this worker runs
+or shortly before `send-test`.
 
 ## Configuration
 
@@ -105,10 +130,10 @@ live in the persistent `reminder-data` volume.
 | --- | --- |
 | `COMPOSIO_API_KEY` | Composio project API key; required |
 | `COMPOSIO_CONNECTED_ACCOUNT_ID` | Existing Instagram connected-account ID; required |
+| `COMPOSIO_USER_ID` | Composio user ID associated with that connection; required (distinct from the Instagram user ID) |
 | `INSTAGRAM_USER_ID` | `me` by default, or the numeric Instagram account ID |
 | `INSTAGRAM_TOOLKIT_VERSION` | Pinned dated version; default `20260819_00` |
 | `TELEGRAM_BOT_TOKEN` | BotFather token; required |
-| `TELEGRAM_CHAT_ID` | Telegram destination; required |
 | `COVER_DIFFERENCE_THRESHOLD` | Fraction between 0 and 1; default `0.05` |
 | `DATABASE_PATH` | `/data/reminders.sqlite3` in Docker; `data/reminders.sqlite3` by default locally |
 
@@ -123,13 +148,16 @@ charges according to your existing plans.
   concurrent workers. Use a local disk volume; SQLite and the lock are not intended
   for shared network storage or multiple replicas.
 - A successful delivery records Telegram's message ID. Confirmed sends are not
-  repeated after restart. If Telegram accepts a message but the response is lost,
+  repeated for that recipient after restart. If Telegram accepts a message but the response is lost,
   a retry can produce a duplicate; the Bot API has no send idempotency key.
 - Temporary HTTP failures receive up to three attempts with backoff. Long
   `Retry-After` delays are stored across restarts and respected. Unsent reminders
   remain pending and are rechecked against the current cover before another attempt.
-- `status` shows post/reminder counts and the last cycle's errors. Health is unhealthy
-  if the last cycle failed or no successful cycle completed in 125 minutes.
+- Sends are paced to at most 20 per second overall and one per second per chat;
+  Telegram retry delays take precedence. Paid broadcasts are not enabled.
+- `status` shows post/reminder counts, active/inactive subscribers, per-recipient
+  delivery counts, update-poll status, and the last cycle's errors. Health is unhealthy
+  if the latest cover cycle or update poll failed or either is older than 125 minutes.
   Docker reports health; `restart: unless-stopped` restarts exited processes, not
   unhealthy running processes. Have your server monitor container health.
 - Logs contain media IDs and sanitized error codes, not credentials, signed URLs,
@@ -143,7 +171,21 @@ charges according to your existing plans.
 - Stop the worker before backing up the entire data volume. Restore that volume
   to preserve activation, verification, and reminder history. Do not remove the
   volume during routine redeployment. Use a separate database for a different
-  account or Telegram destination.
+  Instagram account or Telegram bot. Bot identity is checked using `getMe`; rotating
+  the token for the same bot preserves its subscriber list.
+
+### Upgrading from a single destination
+
+Stop the worker and back up its data volume before deploying this version. The
+first database open migrates schema version 1 to 2 transactionally, preserving
+activation, cover verification, Reel state, polling schedule, and historical sends.
+The previous destination is not automatically subscribed. Remove `TELEGRAM_CHAT_ID`
+from `.env` and have recipients send `/start` again; an old environment value is ignored.
+Previously sent milestones are not replayed. A legacy pending milestone captures
+the active subscribers after its next successful cover check.
+
+The old application cannot open a version 2 database. To roll back, stop the worker
+and restore the pre-upgrade backup along with the previous application version.
 
 ## Local development and validation
 
@@ -165,16 +207,22 @@ CA bundle (for example, `SSL_CERT_FILE=/etc/ssl/cert.pem`). TLS verification mus
 remain enabled.
 
 The offline tests exercise actual SQLite persistence, domain transitions, and real
-Pillow reference photographs. They do not fabricate Instagram/Telegram responses.
+Pillow reference photographs, including subscriber persistence, recipient snapshots,
+partial deliveries, cancellation, and migration rollback. They do not fabricate
+Instagram/Telegram responses.
 The optional live test reads your connected account:
 
 ```sh
 RUN_LIVE_TESTS=1 .venv/bin/python -m unittest discover -s tests -p test_live.py -v
 ```
 
-Live acceptance requires: successful `check` and `send-test`; passing cover-edit
-verification; an unchanged Reel receiving both reminders; and an edited Reel
-cancelling the applicable remaining reminder. Do not claim those checks passed
+Live acceptance requires: successful `check`; two private users sending `/start`
+and both receiving `send-test`; `/stop` excluding one user from subsequent tests;
+passing cover-edit verification; an unchanged Reel delivering both reminders to
+active subscribers without repeating recorded deliveries after restart; and an
+edited Reel cancelling the applicable remaining deliveries. Also verify that
+blocking the bot removes that recipient and group commands do not subscribe a group.
+Do not claim those checks passed
 based on the offline suite. `run --once` respects the persisted hourly schedule and
 the live-verification gate.
 

@@ -100,7 +100,10 @@ def healthcheck(path: Path, now: float) -> bool:
         with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=2)) as db:
             row = db.execute("SELECT value FROM settings WHERE key='last_cycle'").fetchone()
             cycle = json.loads(row[0]) if row else None
-        return bool(cycle and cycle["ok"] and 0 <= now - cycle["completed_at"] <= 2 * POLL_SECONDS + 300)
+            row = db.execute("SELECT value FROM settings WHERE key='telegram_updates'").fetchone()
+            updates = json.loads(row[0]) if row else None
+        return bool(cycle and cycle["ok"] and 0 <= now - cycle["completed_at"] <= 2 * POLL_SECONDS + 300
+                    and updates and updates["ok"] and 0 <= now - updates["checked_at"] <= 2 * POLL_SECONDS + 300)
     except (OSError, sqlite3.Error, ValueError, KeyError, TypeError):
         return False
 
@@ -111,7 +114,7 @@ def parser() -> argparse.ArgumentParser:
     run = commands.add_parser("run", help="Run the verified monitor")
     run.add_argument("--once", action="store_true", help="Run one poll if due; keep the hourly schedule")
     commands.add_parser("check", help="Read Instagram media and validate Telegram bot credentials")
-    commands.add_parser("send-test", help="Send a real test notification to the configured Telegram chat")
+    commands.add_parser("send-test", help="Send a real test notification to all active Telegram subscribers")
     commands.add_parser("status", help="Show stored counts and the last poll result")
     commands.add_parser("healthcheck", help="Exit successfully when the latest poll is healthy and recent")
     capture_command = commands.add_parser("capture-cover", help="Save a real thumbnail and verification metadata")
@@ -158,14 +161,18 @@ def main() -> int:
                 raise ServiceError("composio", "missing_media_collection")
             reels = [reel for item in items if (reel := Reel.from_media(item))]
             bot = telegram.check()
+            telegram.check_polling()
             print_json({
                 "instagram": "accessible", "telegram_bot_id": bot.get("id"),
                 "toolkit_version": config.toolkit_version,
                 "recent_reels": [{"media_id": reel.media_id, "permalink": reel.permalink} for reel in reels[:5]],
-                "telegram_chat_delivery": "Use send-test to verify the configured destination",
+                "telegram_delivery": "Send /start in the bot's private chat, then use send-test to verify delivery",
             })
         elif args.command == "send-test":
-            print_json({"message_id": telegram.send("Cover Reminder: Telegram delivery is working.")})
+            with exclusive_worker(config.database_path), closing(Store(config.database_path)) as store:
+                result = Worker(config, store, stop).send_test()
+                print_json(result)
+                return 0 if result["sent"] and not result["failed"] and not result["unattempted"] else 1
         elif args.command == "capture-cover":
             capture(instagram, args.media_id, args.output, config)
         elif args.command == "verify-cover":

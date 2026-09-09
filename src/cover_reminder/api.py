@@ -11,7 +11,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-from .config import Config
+from .config import Config, ConfigurationError
 from .images import MAX_IMAGE_BYTES
 from .model import Reel
 
@@ -148,6 +148,7 @@ class Instagram:
         result = self.http.json(
             "composio", f"https://backend.composio.dev/api/v3.1/tools/execute/{tool}",
             {"connected_account_id": self.config.connected_account_id,
+             "user_id": self.config.composio_user_id,
              "version": self.config.toolkit_version, "arguments": arguments},
             {"x-api-key": self.config.composio_api_key},
         )
@@ -219,8 +220,10 @@ class Instagram:
 class Telegram:
     def __init__(self, config: Config, http: Http):
         self.config, self.http = config, http
+        self.next_send_at = 0.0
+        self.chat_send_times: dict[int, float] = {}
 
-    def call(self, method: str, payload: dict | None = None) -> dict:
+    def call(self, method: str, payload: dict | None = None) -> dict | list:
         response = self.http.json(
             "telegram", f"https://api.telegram.org/bot{self.config.telegram_token}/{method}",
             payload,
@@ -231,18 +234,51 @@ class Telegram:
             code = response.get("error_code")
             reason = f"api_{code}" if isinstance(code, int) else "unsuccessful_response"
             raise ServiceError("telegram", reason, delay)
-        if not isinstance(response.get("result"), dict):
+        expected = list if method == "getUpdates" else dict
+        if not isinstance(response.get("result"), expected):
             raise ServiceError("telegram", "unexpected_response")
         return response["result"]
 
     def check(self) -> dict:
-        return self.call("getMe")
+        bot = self.call("getMe")
+        if (type(bot.get("id")) is not int or bot["id"] <= 0
+                or bot.get("is_bot") is not True or not isinstance(bot.get("username"), str)):
+            raise ServiceError("telegram", "invalid_bot_identity")
+        return bot
 
-    def send(self, text: str) -> int:
-        response = self.call("sendMessage", {
-            "chat_id": self.config.telegram_chat_id, "text": text,
-            "disable_notification": False,
-        })
+    def check_polling(self) -> None:
+        webhook = self.call("getWebhookInfo")
+        if not isinstance(webhook.get("url"), str):
+            raise ServiceError("telegram", "unexpected_response")
+        if webhook["url"]:
+            raise ConfigurationError(
+                "Telegram has an active webhook; use a dedicated bot without a webhook for this worker"
+            )
+
+    def updates(self, offset: int | None, timeout: int = 10) -> list[dict]:
+        payload = {"timeout": timeout, "limit": 100, "allowed_updates": ["message", "my_chat_member"]}
+        if offset is not None:
+            payload["offset"] = offset
+        updates = self.call("getUpdates", payload)
+        if any(not isinstance(update, dict) or type(update.get("update_id")) is not int
+               for update in updates):
+            raise ServiceError("telegram", "invalid_updates")
+        return updates
+
+    def send(self, chat_id: int, text: str) -> int:
+        # Stay below free broadcast limits and avoid bursts to the same subscriber.
+        delay = max(self.next_send_at, self.chat_send_times.get(chat_id, 0)) - time.monotonic()
+        if self.http.stop.wait(max(0, delay)):
+            raise ServiceError("telegram", "stopping")
+        try:
+            response = self.call("sendMessage", {
+                "chat_id": chat_id, "text": text, "disable_notification": False,
+            })
+        finally:
+            now = time.monotonic()
+            self.next_send_at = now + 0.05
+            self.chat_send_times = {chat: until for chat, until in self.chat_send_times.items() if until > now}
+            self.chat_send_times[chat_id] = now + 1
         message_id = response.get("message_id")
         if not isinstance(message_id, int) or isinstance(message_id, bool):
             raise ServiceError("telegram", "missing_message_id")

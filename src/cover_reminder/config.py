@@ -18,15 +18,15 @@ class Config:
     instagram_user_id: str
     toolkit_version: str
     telegram_token: str = field(repr=False)
-    telegram_chat_id: str
     database_path: Path
+    composio_user_id: str
     difference_threshold: float = 0.05
 
     @classmethod
     def from_environment(cls) -> "Config":
         required = (
             "COMPOSIO_API_KEY", "COMPOSIO_CONNECTED_ACCOUNT_ID",
-            "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID",
+            "TELEGRAM_BOT_TOKEN", "COMPOSIO_USER_ID",
         )
         missing = [name for name in required if not os.environ.get(name, "").strip()]
         if missing:
@@ -44,14 +44,19 @@ class Config:
         if not math.isfinite(threshold) or not 0 < threshold < 1:
             raise ConfigurationError("COVER_DIFFERENCE_THRESHOLD must be between 0 and 1")
         return cls(
-            os.environ[required[0]].strip(), os.environ[required[1]].strip(),
-            user, version, os.environ[required[2]].strip(),
-            os.environ[required[3]].strip(), database_path(), threshold,
+            composio_api_key=os.environ[required[0]].strip(),
+            connected_account_id=os.environ[required[1]].strip(),
+            instagram_user_id=user, toolkit_version=version,
+            telegram_token=os.environ[required[2]].strip(),
+            database_path=database_path(),
+            composio_user_id=os.environ[required[3]].strip(),
+            difference_threshold=threshold,
         )
 
     def identity(self) -> dict:
         return {
             "connected_account_id": self.connected_account_id,
+            "composio_user_id": self.composio_user_id,
             "instagram_user_id": self.instagram_user_id,
         }
 
