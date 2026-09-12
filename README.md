@@ -1,28 +1,29 @@
 # Cover Reminder
 
 Checks one Instagram account's **Reels every hour**, using its existing Composio
-connection. Sends Telegram reminders **24 hours and 48 hours after publication**
-when no cover change has been confirmed. The 48-hour reminder is the final one.
-Reminders go to every active private-chat subscriber who has sent `/start` to the
-bot. No configured chat ID is needed. Send `/stop` to unsubscribe.
+connection. Sends a Telegram alert when a cover change is first detected. If the
+cover remains unchanged, it sends reminders **24 hours and 48 hours after publication**.
+The 48-hour check is final. Alerts and reminders go to every active private-chat
+subscriber who has sent `/start` to the bot. No configured chat ID is needed.
+Send `/stop` to unsubscribe.
 
 ## Behavior
 
 - A new Reel's first successfully downloaded thumbnail becomes its baseline.
 - Covers are compared as normalized 64×64 RGB images, not by their CDN URLs.
   The default difference threshold is 5% mean absolute pixel difference.
-- Two consecutive hourly observations must differ from the baseline and agree
-  with each other before a change cancels the remaining reminders. An unchanged
-  image, failed check, or gap longer than 90 minutes resets confirmation.
-- A tentative change defers a due reminder for another check. Otherwise, reminders
-  arrive on the first successful hourly check at or after each deadline, normally
-  within an hour. Outages, rate limits, and verification failures can delay delivery.
+- The first hourly observation above the threshold sends one change alert and
+  cancels any remaining unchanged-cover reminders. The new cover's content is not
+  classified or attached to the alert.
+- Reminders arrive on the first successful hourly check at or after each deadline,
+  normally within an hour. Outages and rate limits can delay delivery.
 - Missing/unreadable thumbnails and API errors never count as unchanged covers.
   The service defers delivery until it can check the current cover successfully.
-- After an outage that spans both deadlines, only the 48-hour reminder is sent.
+- After an outage that spans both deadlines, the first successful check sends
+  either a change alert or the 48-hour unchanged-cover reminder.
 - Only Reels published after the **first successful activation** are eligible.
   Restarts preserve that activation time, post state, and the polling schedule.
-- Each reminder takes a snapshot of active subscribers when it is first queued.
+- Each alert or reminder takes a snapshot of active subscribers when it is first queued.
   New subscribers receive subsequent broadcasts, including upcoming reminders
   for already monitored Reels. Broadcasts already queued or completed are not replayed.
   With no subscribers, that milestone is skipped; the final milestone still
@@ -33,9 +34,10 @@ bot. No configured chat ID is needed. Send `/stop` to unsubscribe.
   Unblocking alone does not resubscribe them.
 
 The API does not provide a documented cover-edit flag. An edit before the first
-check, a visually subtle edit, or a cached thumbnail can result in an unnecessary
-reminder. The message therefore says that no change was **detected**. The worker
-does not publish posts or change covers.
+check, a visually subtle edit, a cached thumbnail, or image variation above the
+threshold can cause a missed detection or false alert. Messages therefore say that
+a change was **detected**, not that Instagram confirmed an edit. The worker does
+not publish posts or change covers.
 
 ## Set up on an always-on Docker server
 
@@ -56,54 +58,13 @@ does not publish posts or change covers.
    docker compose run --rm reminder send-test
    ```
 
-`check` reads Instagram media and checks the Telegram bot token. It prints recent
-Reel IDs for the next step. `send-test` collects pending subscriptions and sends a
-real notification to every active subscriber. It reports sent, failed, inactive,
-and unattempted counts. If nobody is subscribed, send `/start` and rerun it.
+`check` reads Instagram media and checks the Telegram bot token. `send-test` collects
+pending subscriptions and sends a real notification to every active subscriber. It
+reports sent, failed, inactive, and unattempted counts. If nobody is subscribed,
+send `/start` and rerun it.
 Stop the worker before running `send-test`; both commands use the same exclusive
 lock. Repeating `send-test` intentionally sends another test notification.
-No AI-model key is needed.
-
-### Verify that Instagram exposes cover edits
-
-Monitoring stays disabled until this live test passes. This avoids silently
-assuming that the API's thumbnail reflects your edits.
-
-Choose a Reel whose cover you intend to change. Use its numeric `media_id` from
-`check`, not the shortcode in its Instagram URL. In your shell, set `REEL_ID` to
-that numeric ID, then capture the cover:
-
-```sh
-docker compose run --rm reminder capture-cover "$REEL_ID" --output /data/verification/before.img
-```
-
-Change that Reel's cover in Instagram. Once the change is visible, capture it:
-
-```sh
-docker compose run --rm reminder capture-cover "$REEL_ID" --output /data/verification/after.img
-```
-
-Leave the new cover unchanged and capture it again one hour later:
-
-```sh
-docker compose run --rm reminder capture-cover "$REEL_ID" --output /data/verification/confirmation.img
-docker compose run --rm reminder compare-covers /data/verification/before.img /data/verification/after.img
-docker compose run --rm reminder verify-cover /data/verification/before.img /data/verification/after.img /data/verification/confirmation.img
-```
-
-Each capture saves the actual thumbnail bytes and a sidecar containing its media
-ID, account identity, capture time, detector settings, and image checksum. It does
-not save API keys, bot tokens, or signed image URLs. Verification requires both
-later covers to exceed the baseline threshold and agree with each other.
-
-If verification fails, take fresh captures after allowing for API caching; use
-new filenames because captures cannot be overwritten. If changes remain invisible,
-this detection method cannot be enabled for your account. Do not bypass the gate.
-Changing the toolkit version or comparison threshold requires new verification.
-Before selecting a different threshold, also compare two captures taken without
-an edit to check that normal image variation stays below it.
-
-Start the monitor after verification:
+No AI-model key is needed. Start the monitor after the connection and delivery checks:
 
 ```sh
 docker compose up -d
@@ -111,13 +72,12 @@ docker compose logs --tail=100 reminder
 docker compose exec reminder python -m cover_reminder status
 ```
 
-The verification Reel predates activation and will not generate reminders.
-The container runs as a non-root user; SQLite, captures, and verification evidence
-live in the persistent `reminder-data` volume.
+The container runs as a non-root user; SQLite state lives in the persistent
+`reminder-data` volume.
 The running worker collects subscriptions between hourly cover checks, using
 10-second Telegram long polling. `/start` and `/stop` receive confirmation messages.
 Registration is stored even if a confirmation message cannot be delivered.
-Before monitoring is verified and running, `send-test` can collect subscriptions.
+Before monitoring is running, `send-test` can collect subscriptions.
 
 Telegram retains incoming updates for at most 24 hours. It does not provide a list
 of everyone who ever started a bot. Anyone whose previous `/start` update has
@@ -151,41 +111,46 @@ charges according to your existing plans.
   repeated for that recipient after restart. If Telegram accepts a message but the response is lost,
   a retry can produce a duplicate; the Bot API has no send idempotency key.
 - Temporary HTTP failures receive up to three attempts with backoff. Long
-  `Retry-After` delays are stored across restarts and respected. Unsent reminders
-  remain pending and are rechecked against the current cover before another attempt.
+  `Retry-After` delays are stored across restarts and respected. Unsent 24-hour
+  reminders are rechecked against the current cover; final reminders and change
+  alerts retry from their durable recipient snapshots.
 - Sends are paced to at most 20 per second overall and one per second per chat;
   Telegram retry delays take precedence. Paid broadcasts are not enabled.
-- `status` shows post/reminder counts, active/inactive subscribers, per-recipient
-  delivery counts, update-poll status, and the last cycle's errors. Health is unhealthy
+- `status` shows post, reminder, change-alert, subscriber, and per-recipient delivery
+  counts, update-poll status, and the last cycle's errors. Health is unhealthy
   if the latest cover cycle or update poll failed or either is older than 125 minutes.
   Docker reports health; `restart: unless-stopped` restarts exited processes, not
   unhealthy running processes. Have your server monitor container health.
 - Logs contain media IDs and sanitized error codes, not credentials, signed URLs,
   captions, or raw provider responses. For `composio:tool_execution_failed`, inspect
   the execution in your Composio dashboard for the provider's detailed error.
-- An inaccessible/deleted Reel remains unverifiable. It does not produce a cover
-  reminder; its repeated check failures appear in logs and health.
+- An inaccessible/deleted Reel does not produce an alert or reminder; its repeated
+  check failures appear in logs and health.
 - Discovery follows all pages and advances its checkpoint only after the whole scan
   succeeds. A one-hour overlap accommodates timestamp boundaries and brief indexing
   delays. Longer provider indexing delays can still cause missed posts.
 - Stop the worker before backing up the entire data volume. Restore that volume
-  to preserve activation, verification, and reminder history. Do not remove the
+  to preserve activation, alert, and reminder history. Do not remove the
   volume during routine redeployment. Use a separate database for a different
   Instagram account or Telegram bot. Bot identity is checked using `getMe`; rotating
   the token for the same bot preserves its subscriber list.
 
-### Upgrading from a single destination
+### Upgrading an existing database
 
 Stop the worker and back up its data volume before deploying this version. The
-first database open migrates schema version 1 to 2 transactionally, preserving
-activation, cover verification, Reel state, polling schedule, and historical sends.
-The previous destination is not automatically subscribed. Remove `TELEGRAM_CHAT_ID`
-from `.env` and have recipients send `/start` again; an old environment value is ignored.
-Previously sent milestones are not replayed. A legacy pending milestone captures
-the active subscribers after its next successful cover check.
+first database open migrates schema versions 1 or 2 to 3 transactionally, preserving
+activation, Reel state, polling schedule, subscribers, and historical sends. Stored
+cover-verification evidence and old capture files are ignored and are not deleted.
+Reels already recorded as changed do not generate retroactive change alerts.
 
-The old application cannot open a version 2 database. To roll back, stop the worker
-and restore the pre-upgrade backup along with the previous application version.
+When upgrading directly from schema version 1, the previous destination is not
+automatically subscribed. Remove `TELEGRAM_CHAT_ID` from `.env` and have recipients
+send `/start` again; an old environment value is ignored. Previously sent milestones
+are not replayed. A legacy pending milestone captures active subscribers after its
+next successful cover check.
+
+Older applications cannot open a version 3 database. To roll back, stop the worker
+and restore the pre-upgrade backup with the previous application version.
 
 ## Local development and validation
 
@@ -218,13 +183,11 @@ RUN_LIVE_TESTS=1 .venv/bin/python -m unittest discover -s tests -p test_live.py 
 
 Live acceptance requires: successful `check`; two private users sending `/start`
 and both receiving `send-test`; `/stop` excluding one user from subsequent tests;
-passing cover-edit verification; an unchanged Reel delivering both reminders to
-active subscribers without repeating recorded deliveries after restart; and an
-edited Reel cancelling the applicable remaining deliveries. Also verify that
-blocking the bot removes that recipient and group commands do not subscribe a group.
-Do not claim those checks passed
-based on the offline suite. `run --once` respects the persisted hourly schedule and
-the live-verification gate.
+an unchanged Reel delivering both reminders without repeating recorded deliveries
+after restart; and an edited Reel sending one change alert and cancelling applicable
+remaining reminders. Also verify that blocking the bot removes that recipient and
+group commands do not subscribe a group. Do not claim those checks passed based on
+the offline suite. `run --once` respects the persisted hourly schedule.
 
 ## API references
 

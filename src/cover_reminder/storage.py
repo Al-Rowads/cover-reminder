@@ -6,7 +6,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
-from .config import POLL_SECONDS, Config, ConfigurationError
+from .config import Config, ConfigurationError
 from .images import difference
 from .model import Reel
 
@@ -32,7 +32,7 @@ class Store:
         os.chmod(path, 0o600)
         self.db.row_factory = sqlite3.Row
         version = self.db.execute("PRAGMA user_version").fetchone()[0]
-        if version not in {0, 1, 2}:
+        if version not in {0, 1, 2, 3}:
             self.db.close()
             raise ConfigurationError("Database schema is newer than this application")
         self.db.execute("PRAGMA foreign_keys=ON")
@@ -86,10 +86,28 @@ class Store:
             );
             CREATE INDEX IF NOT EXISTS deliveries_by_status ON deliveries(media_id, hours, status);
             CREATE INDEX IF NOT EXISTS deliveries_by_subscriber ON deliveries(chat_id, status);
+            CREATE TABLE IF NOT EXISTS cover_change_alerts (
+                media_id TEXT PRIMARY KEY REFERENCES reels(media_id),
+                status TEXT NOT NULL CHECK(status IN ('pending', 'sent', 'superseded')),
+                audience_captured INTEGER NOT NULL DEFAULT 0 CHECK(audience_captured IN (0, 1)),
+                detected_at REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS cover_change_deliveries (
+                media_id TEXT NOT NULL REFERENCES cover_change_alerts(media_id),
+                chat_id INTEGER NOT NULL REFERENCES subscribers(chat_id),
+                status TEXT NOT NULL CHECK(status IN ('pending', 'sent', 'cancelled')),
+                message_id INTEGER,
+                sent_at REAL,
+                PRIMARY KEY (media_id, chat_id)
+            );
+            CREATE INDEX IF NOT EXISTS cover_change_deliveries_by_status
+                ON cover_change_deliveries(media_id, status);
+            CREATE INDEX IF NOT EXISTS cover_change_deliveries_by_subscriber
+                ON cover_change_deliveries(chat_id, status);
         """)
         # Another connection may have migrated while this connection waited for the write lock.
         version = self.db.execute("PRAGMA user_version").fetchone()[0]
-        if version not in {0, 1, 2}:
+        if version not in {0, 1, 2, 3}:
             raise ConfigurationError("Database schema is newer than this application")
         if version < 2:
             self.db.execute("ALTER TABLE reminders ADD COLUMN audience_captured INTEGER NOT NULL DEFAULT 0")
@@ -97,7 +115,7 @@ class Store:
             if identity is not None:
                 identity.pop("telegram_chat_id", None)
                 self._set("monitor_identity", identity)
-        self.db.execute("PRAGMA user_version=2")
+        self.db.execute("PRAGMA user_version=3")
         self.db.commit()
 
     def close(self) -> None:
@@ -165,13 +183,17 @@ class Store:
         self.db.execute("UPDATE deliveries SET status='cancelled' WHERE chat_id=? AND status='pending'", (chat_id,))
         for row in affected:
             self._finish_reminder(row["media_id"], row["hours"])
+        changed = self.db.execute(
+            "SELECT media_id FROM cover_change_deliveries WHERE chat_id=? AND status='pending'", (chat_id,)
+        ).fetchall()
+        self.db.execute(
+            "UPDATE cover_change_deliveries SET status='cancelled' WHERE chat_id=? AND status='pending'",
+            (chat_id,),
+        )
+        for row in changed:
+            self._finish_change_alert(row["media_id"])
 
     def activate(self, config: Config, now: float) -> None:
-        verification = self.get("cover_verification", {})
-        if verification.get("detector") != config.detector_identity():
-            raise ConfigurationError(
-                "Live cover verification is required; follow the capture-cover / verify-cover steps in README.md"
-            )
         self.check_account(config)
         self.set("monitor_identity", config.identity())
         if self.get("activated_at") is None:
@@ -212,25 +234,14 @@ class Store:
             return row
         baseline = row["baseline"] if row["baseline"] is not None else sample
         score = difference(baseline, sample)
-        streak = 0
-        if score > threshold:
-            previous = row["previous_sample"]
-            consecutive = (
-                row["last_checked_at"] is not None
-                and now - row["last_checked_at"] <= POLL_SECONDS * 1.5
-            )
-            stable = (
-                previous is not None and difference(previous, sample) <= threshold
-                and difference(baseline, previous) > threshold
-            )
-            streak = row["change_streak"] + 1 if consecutive and stable else 1
-        status = "changed" if streak >= 2 else "pending"
+        changed = score > threshold
+        status = "changed" if changed else "pending"
         with self.db:
             self.db.execute("""
                 UPDATE reels SET baseline=?, previous_sample=?, change_streak=?, status=?,
                     last_checked_at=?, last_difference=?, last_error=NULL WHERE media_id=?
-            """, (baseline, sample, streak, status, now, score, media_id))
-            if status == "changed":
+            """, (baseline, sample if changed else None, int(changed), status, now, score, media_id))
+            if changed:
                 self.db.execute(
                     "UPDATE deliveries SET status='cancelled' WHERE media_id=? AND status='pending'", (media_id,)
                 )
@@ -238,6 +249,21 @@ class Store:
                     "UPDATE reminders SET status='superseded' WHERE media_id=? AND status='pending'",
                     (media_id,),
                 )
+                self.db.execute(
+                    """INSERT OR IGNORE INTO cover_change_alerts
+                       (media_id, status, audience_captured, detected_at) VALUES (?, 'pending', 0, ?)""",
+                    (media_id, now),
+                )
+                captured = self.db.execute("""
+                    UPDATE cover_change_alerts SET audience_captured=1
+                    WHERE media_id=? AND status='pending' AND audience_captured=0
+                """, (media_id,))
+                if captured.rowcount:
+                    self.db.execute("""
+                        INSERT INTO cover_change_deliveries (media_id, chat_id, status)
+                        SELECT ?, chat_id, 'pending' FROM subscribers WHERE active=1
+                    """, (media_id,))
+                    self._finish_change_alert(media_id)
         return self.reel(media_id)
 
     def observation_failed(self, media_id: str, code: str) -> None:
@@ -249,7 +275,7 @@ class Store:
 
     def queue_due(self, media_id: str, now: float) -> int | None:
         row = self.reel(media_id)
-        # A pending delivery must be revalidated against a fresh cover on every retry.
+        # A 24-hour delivery must be revalidated against a fresh cover on every retry.
         if (row["status"] != "pending" or row["last_checked_at"] != now
                 or row["last_error"] or row["baseline"] is None or row["change_streak"]):
             return None
@@ -281,6 +307,10 @@ class Store:
                     SELECT ?, ?, chat_id, 'pending' FROM subscribers WHERE active=1
                 """, (media_id, hours))
                 self._finish_reminder(media_id, hours)
+            if hours == 48:
+                self.db.execute(
+                    "UPDATE reels SET status='completed' WHERE media_id=? AND status='pending'", (media_id,)
+                )
         reminder = self.db.execute(
             "SELECT status FROM reminders WHERE media_id=? AND hours=?", (media_id, hours),
         ).fetchone()
@@ -293,6 +323,20 @@ class Store:
             WHERE d.media_id=? AND d.hours=? AND d.status='pending' AND s.active=1 AND r.status='pending'
             ORDER BY d.chat_id
         """, (media_id, hours))]
+
+    def pending_reminders_for_delivery(self, now: float) -> list[sqlite3.Row]:
+        return self.db.execute("""
+            SELECT reminders.media_id, reminders.hours, reels.permalink
+            FROM reminders JOIN reels USING(media_id)
+            WHERE reminders.status='pending' AND (
+                reminders.hours=48 OR (
+                    reminders.hours=24 AND reels.status='pending'
+                    AND reels.last_checked_at=? AND reels.last_error IS NULL
+                    AND reels.baseline IS NOT NULL AND reels.change_streak=0
+                )
+            )
+            ORDER BY reels.published_at, reminders.media_id
+        """, (now,)).fetchall()
 
     def delivery_pending(self, media_id: str, hours: int, chat_id: int) -> bool:
         return self.db.execute("""
@@ -323,6 +367,55 @@ class Store:
         if hours == 48:
             self.db.execute("UPDATE reels SET status='completed' WHERE media_id=? AND status='pending'", (media_id,))
 
+    def pending_change_alerts(self) -> list[sqlite3.Row]:
+        return self.db.execute("""
+            SELECT cover_change_alerts.media_id, reels.permalink
+            FROM cover_change_alerts JOIN reels USING(media_id)
+            WHERE cover_change_alerts.status='pending'
+            ORDER BY cover_change_alerts.detected_at, cover_change_alerts.media_id
+        """).fetchall()
+
+    def pending_change_deliveries(self, media_id: str) -> list[int]:
+        return [row[0] for row in self.db.execute("""
+            SELECT delivery.chat_id
+            FROM cover_change_deliveries AS delivery
+            JOIN subscribers USING(chat_id)
+            JOIN cover_change_alerts USING(media_id)
+            WHERE delivery.media_id=? AND delivery.status='pending'
+                AND subscribers.active=1 AND cover_change_alerts.status='pending'
+            ORDER BY delivery.chat_id
+        """, (media_id,))]
+
+    def change_delivery_pending(self, media_id: str, chat_id: int) -> bool:
+        return self.db.execute("""
+            SELECT 1 FROM cover_change_deliveries
+            WHERE media_id=? AND chat_id=? AND status='pending'
+        """, (media_id, chat_id)).fetchone() is not None
+
+    def change_sent(self, media_id: str, chat_id: int, message_id: int, now: float) -> None:
+        with self.db:
+            updated = self.db.execute("""
+                UPDATE cover_change_deliveries SET status='sent', message_id=?, sent_at=?
+                WHERE media_id=? AND chat_id=? AND status='pending'
+            """, (message_id, now, media_id, chat_id))
+            if updated.rowcount != 1:
+                raise ValueError("change_delivery_not_pending")
+            self._finish_change_alert(media_id)
+
+    def _finish_change_alert(self, media_id: str) -> None:
+        if self.db.execute("""
+            SELECT 1 FROM cover_change_deliveries
+            WHERE media_id=? AND status='pending' LIMIT 1
+        """, (media_id,)).fetchone():
+            return
+        sent = self.db.execute("""
+            SELECT 1 FROM cover_change_deliveries
+            WHERE media_id=? AND status='sent' LIMIT 1
+        """, (media_id,)).fetchone()
+        self.db.execute("""
+            UPDATE cover_change_alerts SET status=? WHERE media_id=? AND status='pending'
+        """, ("sent" if sent else "superseded", media_id))
+
     def summary(self) -> dict:
         return {
             "activated_at": self.get("activated_at"),
@@ -333,6 +426,12 @@ class Store:
                 "SELECT count(*) FROM subscribers WHERE active=0"
             ).fetchone()[0]},
             "deliveries": dict(self.db.execute("SELECT status, count(*) FROM deliveries GROUP BY status").fetchall()),
+            "cover_change_alerts": dict(self.db.execute(
+                "SELECT status, count(*) FROM cover_change_alerts GROUP BY status"
+            ).fetchall()),
+            "cover_change_deliveries": dict(self.db.execute(
+                "SELECT status, count(*) FROM cover_change_deliveries GROUP BY status"
+            ).fetchall()),
             "reels": dict(self.db.execute("SELECT status, count(*) FROM reels GROUP BY status").fetchall()),
             "reminders": dict(self.db.execute("SELECT status, count(*) FROM reminders GROUP BY status").fetchall()),
         }

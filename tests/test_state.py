@@ -73,9 +73,12 @@ class StateTests(unittest.TestCase):
     def test_unsent_reminder_is_retried_only_after_a_fresh_cover_check(self):
         self.observe(24)
         self.assertEqual(self.due(24), 24)
+        self.assertEqual(len(self.store.pending_reminders_for_delivery(24 * HOUR)), 1)
         self.assertIsNone(self.due(25))
+        self.assertEqual(self.store.pending_reminders_for_delivery(25 * HOUR), [])
         self.observe(25)
         self.assertEqual(self.due(25), 24)
+        self.assertEqual(len(self.store.pending_reminders_for_delivery(25 * HOUR)), 1)
         self.assertEqual(self.store.summary()["reminders"], {"pending": 1})
 
     def test_failed_cover_fetch_defers_due_reminder(self):
@@ -85,10 +88,12 @@ class StateTests(unittest.TestCase):
         self.observe(25)
         self.assertEqual(self.due(25), 24)
 
-    def test_changed_cover_before_first_reminder_cancels_both(self):
-        self.observe(23, self.changed)
+    def test_changed_cover_before_first_reminder_queues_alert_and_cancels_both(self):
+        observation = self.observe(23, self.changed)
+        self.assertEqual(observation["status"], "changed")
         self.assertEqual(self.store.reel(self.reel.media_id)["change_streak"], 1)
-        self.assertEqual(self.observe(24, self.changed)["status"], "changed")
+        self.assertEqual(self.store.pending_change_deliveries(self.reel.media_id), [101])
+        self.assertEqual(self.store.summary()["cover_change_alerts"], {"pending": 1})
         self.assertIsNone(self.due(24))
         self.assertIsNone(self.due(48))
 
@@ -97,44 +102,27 @@ class StateTests(unittest.TestCase):
         self.due(24)
         self.store.sent(self.reel.media_id, 24, 101, 1, 24 * HOUR)
         self.observe(25, self.changed)
-        self.observe(26, self.changed)
         self.assertIsNone(self.due(48))
         self.assertEqual(self.store.summary()["reminders"], {"sent": 1})
+        self.assertEqual(self.store.pending_change_deliveries(self.reel.media_id), [101])
 
-    def test_tentative_change_at_deadline_defers_delivery(self):
-        self.observe(24, self.changed)
-        self.assertIsNone(self.due(24))
-        self.observe(25, self.baseline)
-        self.assertEqual(self.due(25), 24)
+    def test_below_threshold_variation_does_not_count_as_a_change(self):
+        sample = bytes(round(before * 0.99 + after * 0.01)
+                       for before, after in zip(self.baseline, self.changed, strict=True))
+        observation = self.observe(23, sample)
+        self.assertEqual(observation["status"], "pending")
+        self.assertEqual(observation["change_streak"], 0)
+        self.assertEqual(self.store.summary()["cover_change_alerts"], {})
 
-    def test_error_breaks_change_confirmation(self):
-        self.observe(22, self.changed)
-        self.store.observation_failed(self.reel.media_id, "thumbnail:missing_thumbnail")
-        self.assertEqual(self.observe(24, self.changed)["status"], "pending")
-        self.assertEqual(self.observe(25, self.changed)["status"], "changed")
-
-    def test_gap_breaks_change_confirmation(self):
-        self.observe(20, self.changed)
-        self.assertEqual(self.observe(24, self.changed)["status"], "pending")
-        self.assertEqual(self.observe(25, self.changed)["status"], "changed")
-
-    def test_repeating_same_observation_does_not_confirm_a_change(self):
-        self.observe(23, self.changed)
-        self.assertEqual(self.observe(23, self.changed)["change_streak"], 1)
-
-    def test_original_baseline_survives_change_candidates(self):
+    def test_original_baseline_survives_detected_change(self):
         self.observe(23, self.changed)
         self.assertEqual(self.store.reel(self.reel.media_id)["baseline"], self.baseline)
 
-    def test_threshold_change_does_not_reuse_an_invalid_candidate(self):
-        def blend(fraction):
-            return bytes(round(before * (1 - fraction) + after * fraction)
-                         for before, after in zip(self.baseline, self.changed, strict=True))
-
-        self.store.observe(self.reel.media_id, blend(0.2), 23 * HOUR, 0.05)
-        self.assertEqual(self.store.reel(self.reel.media_id)["change_streak"], 1)
-        observation = self.store.observe(self.reel.media_id, blend(0.3), 24 * HOUR, 0.08)
+    def test_threshold_is_applied_to_each_observation(self):
+        observation = self.store.observe(self.reel.media_id, self.changed, 23 * HOUR, 1.0)
         self.assertEqual(observation["status"], "pending")
+        observation = self.store.observe(self.reel.media_id, self.changed, 24 * HOUR, 0.05)
+        self.assertEqual(observation["status"], "changed")
         self.assertEqual(observation["change_streak"], 1)
 
     def test_both_overdue_milestones_are_coalesced(self):
@@ -144,11 +132,17 @@ class StateTests(unittest.TestCase):
         self.assertEqual(self.due(60), 48)
         self.assertEqual(self.store.summary()["reminders"], {"pending": 1, "superseded": 1})
 
-    def test_confirmed_change_supersedes_a_failed_delivery(self):
+    def test_detected_change_wins_at_first_successful_check_after_final_deadline(self):
+        observation = self.observe(60, self.changed)
+        self.assertEqual(observation["status"], "changed")
+        self.assertIsNone(self.due(60))
+        self.assertEqual(self.store.summary()["reminders"], {})
+        self.assertEqual(self.store.pending_change_deliveries(self.reel.media_id), [101])
+
+    def test_detected_change_supersedes_a_failed_delivery(self):
         self.observe(24)
         self.due(24)
         self.observe(25, self.changed)
-        self.observe(26, self.changed)
         self.assertEqual(self.store.summary()["reminders"], {"superseded": 1})
 
     def test_overlapping_discovery_is_deduplicated(self):
@@ -182,10 +176,17 @@ class StateTests(unittest.TestCase):
                 with exclusive_worker(self.path):
                     self.fail("second worker acquired the lock")
 
-    def test_monitor_rejects_missing_live_verification(self):
+    def test_monitor_activates_without_live_verification(self):
         config = Config("", "", "me", "20260819_00", "", self.path, "")
+        self.store.activate(config, HOUR)
+        self.assertEqual(self.store.get("monitor_identity"), config.identity())
+
+    def test_monitor_still_rejects_a_different_instagram_account(self):
+        config = Config("", "first", "me", "20260819_00", "", self.path, "user")
+        self.store.activate(config, HOUR)
+        other = Config("", "second", "me", "20260819_00", "", self.path, "user")
         with self.assertRaises(ConfigurationError):
-            self.store.activate(config, HOUR)
+            self.store.activate(other, 2 * HOUR)
 
     def test_provider_cooldown_survives_restart(self):
         config = Config("", "", "me", "20260819_00", "", self.path, "")
@@ -276,14 +277,15 @@ class StateTests(unittest.TestCase):
         self.assertEqual(self.store.summary()["reminders"], {"sent": 1})
         self.assertEqual(self.store.summary()["deliveries"], {"sent": 2})
 
-    def test_final_broadcast_completes_only_when_all_recipients_are_terminal(self):
+    def test_final_cover_check_completes_before_all_deliveries_are_terminal(self):
         self.store.apply_update(2, 102, True)
         self.observe(48)
         self.due(48)
-        self.store.sent(self.reel.media_id, 48, 101, 1, 48 * HOUR)
-        self.assertEqual(len(self.store.pending()), 1)
-        self.store.deactivate(102)
         self.assertEqual(self.store.pending(), [])
+        self.store.sent(self.reel.media_id, 48, 101, 1, 48 * HOUR)
+        self.assertEqual(len(self.store.pending_reminders_for_delivery(49 * HOUR)), 1)
+        self.store.deactivate(102)
+        self.assertEqual(self.store.pending_reminders_for_delivery(49 * HOUR), [])
         self.assertEqual(self.store.summary()["deliveries"], {"sent": 1, "cancelled": 1})
 
     def test_new_subscriber_gets_next_broadcast_for_existing_reel(self):
@@ -331,9 +333,44 @@ class StateTests(unittest.TestCase):
         self.due(24)
         self.store.sent(self.reel.media_id, 24, 101, 1, 24 * HOUR)
         self.observe(25, self.changed)
-        self.observe(26, self.changed)
         self.assertEqual(self.store.pending_deliveries(self.reel.media_id, 24), [])
         self.assertEqual(self.store.summary()["deliveries"], {"sent": 1, "cancelled": 1})
+
+    def test_change_alert_partial_delivery_survives_restart(self):
+        self.store.apply_update(2, 102, True)
+        self.observe(23, self.changed)
+        self.assertEqual(self.store.pending_change_deliveries(self.reel.media_id), [101, 102])
+        self.store.change_sent(self.reel.media_id, 101, 11, 23 * HOUR)
+        self.store.close()
+        self.store = Store(self.path)
+        self.assertEqual(self.store.pending_change_deliveries(self.reel.media_id), [102])
+        self.store.change_sent(self.reel.media_id, 102, 12, 24 * HOUR)
+        self.assertEqual(self.store.summary()["cover_change_alerts"], {"sent": 1})
+        self.assertEqual(self.store.summary()["cover_change_deliveries"], {"sent": 2})
+        with self.assertRaises(ValueError):
+            self.store.change_sent(self.reel.media_id, 102, 13, 25 * HOUR)
+
+    def test_change_alert_snapshot_excludes_later_subscribers(self):
+        self.observe(23, self.changed)
+        self.store.apply_update(2, 102, True)
+        self.assertEqual(self.store.pending_change_deliveries(self.reel.media_id), [101])
+
+    def test_unsubscribe_cancels_change_alert_without_reopening_it(self):
+        self.store.apply_update(2, 102, True)
+        self.observe(23, self.changed)
+        self.store.apply_update(3, 101, False)
+        self.store.apply_update(4, 101, True)
+        self.assertEqual(self.store.pending_change_deliveries(self.reel.media_id), [102])
+        self.store.change_sent(self.reel.media_id, 102, 12, 24 * HOUR)
+        self.assertEqual(self.store.summary()["cover_change_deliveries"], {"sent": 1, "cancelled": 1})
+
+    def test_change_without_subscribers_is_not_replayed(self):
+        self.store.deactivate(101)
+        self.observe(23, self.changed)
+        self.assertEqual(self.store.pending_change_alerts(), [])
+        self.store.apply_update(2, 102, True)
+        self.assertEqual(self.store.pending_change_deliveries(self.reel.media_id), [])
+        self.assertEqual(self.store.summary()["cover_change_alerts"], {"superseded": 1})
 
     def test_overdue_final_broadcast_cancels_unsent_first_reminder(self):
         self.store.apply_update(2, 102, True)
@@ -357,13 +394,14 @@ class StateTests(unittest.TestCase):
     def test_migration_preserves_legacy_history_without_subscribing_destination(self):
         config = Config("", "", "me", "20260819_00", "", self.path, "")
         self.store.set("monitor_identity", {**config.identity(), "telegram_chat_id": "101"})
-        self.store.set("cover_verification", {"detector": config.detector_identity()})
         self.store.set("next_poll_at", 25 * HOUR)
         self.observe(24)
         self.due(24)
         self.store.close()
         # Recreate the prior application's schema and actual legacy reminder fields.
         with sqlite3.connect(self.path) as db:
+            db.execute("DROP TABLE cover_change_deliveries")
+            db.execute("DROP TABLE cover_change_alerts")
             db.execute("DROP TABLE deliveries")
             db.execute("DROP TABLE subscribers")
             db.execute("ALTER TABLE reminders DROP COLUMN audience_captured")
@@ -372,6 +410,8 @@ class StateTests(unittest.TestCase):
             db.execute("DELETE FROM settings WHERE key='telegram_recent_updates'")
             db.execute("PRAGMA user_version=1")
         self.store = Store(self.path)
+        self.assertEqual(self.store.db.execute("PRAGMA user_version").fetchone()[0], 3)
+        self.assertEqual(self.store.db.execute("PRAGMA foreign_key_check").fetchall(), [])
         self.store.activate(config, 25 * HOUR)
         self.assertEqual(self.store.subscribers(), [])
         self.assertEqual(self.store.get("monitor_identity"), config.identity())
@@ -389,6 +429,8 @@ class StateTests(unittest.TestCase):
     def test_failed_migration_rolls_back_schema_changes(self):
         self.store.close()
         with sqlite3.connect(self.path) as db:
+            db.execute("DROP TABLE cover_change_deliveries")
+            db.execute("DROP TABLE cover_change_alerts")
             db.execute("DROP TABLE deliveries")
             db.execute("DROP TABLE subscribers")
             db.execute("ALTER TABLE reminders DROP COLUMN audience_captured")
@@ -400,8 +442,23 @@ class StateTests(unittest.TestCase):
             self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 1)
             self.assertNotIn("audience_captured", [row[1] for row in db.execute("PRAGMA table_info(reminders)")])
             self.assertIsNone(db.execute("SELECT name FROM sqlite_master WHERE name='subscribers'").fetchone())
+            self.assertIsNone(db.execute(
+                "SELECT name FROM sqlite_master WHERE name='cover_change_alerts'"
+            ).fetchone())
             db.execute("DELETE FROM settings WHERE key='monitor_identity'")
         self.store = Store(self.path)
+
+    def test_version_two_database_adds_change_alert_tables(self):
+        self.store.close()
+        with sqlite3.connect(self.path) as db:
+            db.execute("DROP TABLE cover_change_deliveries")
+            db.execute("DROP TABLE cover_change_alerts")
+            db.execute("PRAGMA user_version=2")
+        self.store = Store(self.path)
+        self.assertEqual(self.store.db.execute("PRAGMA user_version").fetchone()[0], 3)
+        self.assertIsNotNone(self.store.db.execute(
+            "SELECT name FROM sqlite_master WHERE name='cover_change_alerts'"
+        ).fetchone())
 
     def test_update_failure_preserves_offset_and_reports_unhealthy(self):
         config = Config("", "", "me", "20260819_00", "", self.path, "")

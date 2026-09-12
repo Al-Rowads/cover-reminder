@@ -60,12 +60,5 @@ class Config:
             "instagram_user_id": self.instagram_user_id,
         }
 
-    def detector_identity(self) -> dict:
-        return {
-            **self.identity(), "toolkit_version": self.toolkit_version,
-            "threshold": self.difference_threshold, "algorithm": "rgb64-mae-v1",
-        }
-
-
 def database_path() -> Path:
     return Path(os.environ.get("DATABASE_PATH", "data/reminders.sqlite3"))
