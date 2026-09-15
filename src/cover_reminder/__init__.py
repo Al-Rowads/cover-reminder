@@ -1,1 +1,1 @@
-"""Instagram cover-change alerts and Telegram reminders."""
+"""Instagram cover monitoring and Telegram reminders."""

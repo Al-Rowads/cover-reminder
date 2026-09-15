@@ -34,7 +34,7 @@ def healthcheck(path: Path, now: float) -> bool:
 
 
 def parser() -> argparse.ArgumentParser:
-    root = argparse.ArgumentParser(description="Hourly Instagram Reel cover alerts and reminders")
+    root = argparse.ArgumentParser(description="Hourly Instagram Reel cover reminders")
     commands = root.add_subparsers(dest="command", required=True)
     run = commands.add_parser("run", help="Run the cover monitor")
     run.add_argument("--once", action="store_true", help="Run one poll if due; keep the hourly schedule")

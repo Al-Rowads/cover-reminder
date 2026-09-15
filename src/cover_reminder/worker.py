@@ -10,6 +10,21 @@ from .subscriptions import subscription_change
 
 logger = logging.getLogger(__name__)
 
+SUBSCRIBED_MESSAGE = "برای دریافت یادآوری‌های کاور عضو شدید. برای لغو عضویت، دستور /stop را ارسال کنید."
+UNSUBSCRIBED_MESSAGE = (
+    "عضویت شما در یادآوری‌های کاور لغو شد. برای عضویت دوباره، دستور /start را ارسال کنید."
+)
+TEST_MESSAGE = "یادآور کاور: پیام آزمایشی تلگرام با موفقیت ارسال شد."
+PERSIAN_HOURS = {24: "۲۴", 48: "۴۸"}
+
+
+def reminder_message(hours: int, permalink: str) -> str:
+    final = " این آخرین یادآوری است." if hours == 48 else ""
+    return (
+        f"بررسی کاور: از انتشار این ریلز دست‌کم {PERSIAN_HOURS[hours]} ساعت گذشته است و تغییری "
+        f"در کاور آن تشخیص داده نشده است. لطفاً کاور را بررسی کنید.{final}\n\n{permalink}"
+    )
+
 
 class Worker:
     def __init__(self, config: Config, store: Store, stop: Event):
@@ -41,9 +56,7 @@ class Worker:
                     chat_id, active = subscription_change(update, self.bot_username)
                     applied = self.store.apply_update(update["update_id"], chat_id, active)
                     if applied and active is not None and "message" in update:
-                        text = ("Subscribed to cover alerts and reminders. Send /stop to unsubscribe."
-                                if active else "Unsubscribed from cover alerts and reminders. "
-                                "Send /start to subscribe again.")
+                        text = SUBSCRIBED_MESSAGE if active else UNSUBSCRIBED_MESSAGE
                         try:
                             self.send_to(chat_id, text)
                         except ServiceError as error:
@@ -89,7 +102,7 @@ class Worker:
                 inactive += 1
                 continue
             try:
-                message_id = self.send_to(chat_id, "Cover Reminder: Telegram delivery is working.")
+                message_id = self.send_to(chat_id, TEST_MESSAGE)
                 if message_id is None:
                     inactive += 1
                 else:
@@ -140,10 +153,9 @@ class Worker:
                 continue
             self.store.queue_due(media_id, now)
 
-        alert_sent, alert_errors = self.deliver_change_alerts()
         reminder_sent, reminder_errors = self.deliver_reminders(now)
-        sent += alert_sent + reminder_sent
-        errors += alert_errors + reminder_errors
+        sent += reminder_sent
+        errors += reminder_errors
         self.store.set("last_cycle", {
             "completed_at": time.time(), "ok": errors == 0,
             "discovered": discovered, "checked": checked, "sent": sent, "errors": errors,
@@ -151,38 +163,11 @@ class Worker:
         logger.info("poll_complete discovered=%s checked=%s sent=%s errors=%s", discovered, checked, sent, errors)
         return errors == 0
 
-    def deliver_change_alerts(self) -> tuple[int, int]:
-        sent, errors = 0, 0
-        for alert in self.store.pending_change_alerts():
-            media_id = alert["media_id"]
-            text = f"Cover check: I detected a cover change for this Reel.\n\n{alert['permalink']}"
-            for chat_id in self.store.pending_change_deliveries(media_id):
-                if self.stop.is_set():
-                    return sent, errors
-                if time.monotonic() - self.last_update_check >= 10:
-                    self.sync_updates()
-                if not self.store.change_delivery_pending(media_id, chat_id):
-                    continue
-                try:
-                    message_id = self.send_to(chat_id, text)
-                    if message_id is not None:
-                        self.store.change_sent(media_id, chat_id, message_id, time.time())
-                        sent += 1
-                        logger.info("cover_change_alert_sent media_id=%s message_id=%s", media_id, message_id)
-                except ServiceError as error:
-                    errors += 1
-                    logger.error("cover_change_delivery_failed media_id=%s code=%s", media_id, safe_code(error))
-                    if error.retry_after or error.code in {"http_401", "api_401", "rate_limited"}:
-                        break
-        return sent, errors
-
     def deliver_reminders(self, now: float) -> tuple[int, int]:
         sent, errors = 0, 0
         for reminder in self.store.pending_reminders_for_delivery(now):
             media_id, hours = reminder["media_id"], reminder["hours"]
-            final = " This is the final reminder." if hours == 48 else ""
-            text = (f"Cover check: this Reel is at least {hours} hours old, and I haven't "
-                    f"detected a cover change. Please check its cover.{final}\n\n{reminder['permalink']}")
+            text = reminder_message(hours, reminder["permalink"])
             for chat_id in self.store.pending_deliveries(media_id, hours):
                 if self.stop.is_set():
                     return sent, errors

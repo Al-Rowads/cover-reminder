@@ -88,12 +88,14 @@ class StateTests(unittest.TestCase):
         self.observe(25)
         self.assertEqual(self.due(25), 24)
 
-    def test_changed_cover_before_first_reminder_queues_alert_and_cancels_both(self):
+    def test_changed_cover_before_first_reminder_silently_cancels_both(self):
         observation = self.observe(23, self.changed)
         self.assertEqual(observation["status"], "changed")
         self.assertEqual(self.store.reel(self.reel.media_id)["change_streak"], 1)
-        self.assertEqual(self.store.pending_change_deliveries(self.reel.media_id), [101])
-        self.assertEqual(self.store.summary()["cover_change_alerts"], {"pending": 1})
+        self.assertNotIn("cover_change_alerts", self.store.summary())
+        self.assertIsNone(self.store.db.execute(
+            "SELECT name FROM sqlite_master WHERE name='cover_change_alerts'"
+        ).fetchone())
         self.assertIsNone(self.due(24))
         self.assertIsNone(self.due(48))
 
@@ -104,7 +106,6 @@ class StateTests(unittest.TestCase):
         self.observe(25, self.changed)
         self.assertIsNone(self.due(48))
         self.assertEqual(self.store.summary()["reminders"], {"sent": 1})
-        self.assertEqual(self.store.pending_change_deliveries(self.reel.media_id), [101])
 
     def test_below_threshold_variation_does_not_count_as_a_change(self):
         sample = bytes(round(before * 0.99 + after * 0.01)
@@ -112,7 +113,6 @@ class StateTests(unittest.TestCase):
         observation = self.observe(23, sample)
         self.assertEqual(observation["status"], "pending")
         self.assertEqual(observation["change_streak"], 0)
-        self.assertEqual(self.store.summary()["cover_change_alerts"], {})
 
     def test_original_baseline_survives_detected_change(self):
         self.observe(23, self.changed)
@@ -137,7 +137,6 @@ class StateTests(unittest.TestCase):
         self.assertEqual(observation["status"], "changed")
         self.assertIsNone(self.due(60))
         self.assertEqual(self.store.summary()["reminders"], {})
-        self.assertEqual(self.store.pending_change_deliveries(self.reel.media_id), [101])
 
     def test_detected_change_supersedes_a_failed_delivery(self):
         self.observe(24)
@@ -336,42 +335,6 @@ class StateTests(unittest.TestCase):
         self.assertEqual(self.store.pending_deliveries(self.reel.media_id, 24), [])
         self.assertEqual(self.store.summary()["deliveries"], {"sent": 1, "cancelled": 1})
 
-    def test_change_alert_partial_delivery_survives_restart(self):
-        self.store.apply_update(2, 102, True)
-        self.observe(23, self.changed)
-        self.assertEqual(self.store.pending_change_deliveries(self.reel.media_id), [101, 102])
-        self.store.change_sent(self.reel.media_id, 101, 11, 23 * HOUR)
-        self.store.close()
-        self.store = Store(self.path)
-        self.assertEqual(self.store.pending_change_deliveries(self.reel.media_id), [102])
-        self.store.change_sent(self.reel.media_id, 102, 12, 24 * HOUR)
-        self.assertEqual(self.store.summary()["cover_change_alerts"], {"sent": 1})
-        self.assertEqual(self.store.summary()["cover_change_deliveries"], {"sent": 2})
-        with self.assertRaises(ValueError):
-            self.store.change_sent(self.reel.media_id, 102, 13, 25 * HOUR)
-
-    def test_change_alert_snapshot_excludes_later_subscribers(self):
-        self.observe(23, self.changed)
-        self.store.apply_update(2, 102, True)
-        self.assertEqual(self.store.pending_change_deliveries(self.reel.media_id), [101])
-
-    def test_unsubscribe_cancels_change_alert_without_reopening_it(self):
-        self.store.apply_update(2, 102, True)
-        self.observe(23, self.changed)
-        self.store.apply_update(3, 101, False)
-        self.store.apply_update(4, 101, True)
-        self.assertEqual(self.store.pending_change_deliveries(self.reel.media_id), [102])
-        self.store.change_sent(self.reel.media_id, 102, 12, 24 * HOUR)
-        self.assertEqual(self.store.summary()["cover_change_deliveries"], {"sent": 1, "cancelled": 1})
-
-    def test_change_without_subscribers_is_not_replayed(self):
-        self.store.deactivate(101)
-        self.observe(23, self.changed)
-        self.assertEqual(self.store.pending_change_alerts(), [])
-        self.store.apply_update(2, 102, True)
-        self.assertEqual(self.store.pending_change_deliveries(self.reel.media_id), [])
-        self.assertEqual(self.store.summary()["cover_change_alerts"], {"superseded": 1})
-
     def test_overdue_final_broadcast_cancels_unsent_first_reminder(self):
         self.store.apply_update(2, 102, True)
         self.observe(24)
@@ -400,8 +363,6 @@ class StateTests(unittest.TestCase):
         self.store.close()
         # Recreate the prior application's schema and actual legacy reminder fields.
         with sqlite3.connect(self.path) as db:
-            db.execute("DROP TABLE cover_change_deliveries")
-            db.execute("DROP TABLE cover_change_alerts")
             db.execute("DROP TABLE deliveries")
             db.execute("DROP TABLE subscribers")
             db.execute("ALTER TABLE reminders DROP COLUMN audience_captured")
@@ -410,7 +371,7 @@ class StateTests(unittest.TestCase):
             db.execute("DELETE FROM settings WHERE key='telegram_recent_updates'")
             db.execute("PRAGMA user_version=1")
         self.store = Store(self.path)
-        self.assertEqual(self.store.db.execute("PRAGMA user_version").fetchone()[0], 3)
+        self.assertEqual(self.store.db.execute("PRAGMA user_version").fetchone()[0], 4)
         self.assertEqual(self.store.db.execute("PRAGMA foreign_key_check").fetchall(), [])
         self.store.activate(config, 25 * HOUR)
         self.assertEqual(self.store.subscribers(), [])
@@ -429,8 +390,6 @@ class StateTests(unittest.TestCase):
     def test_failed_migration_rolls_back_schema_changes(self):
         self.store.close()
         with sqlite3.connect(self.path) as db:
-            db.execute("DROP TABLE cover_change_deliveries")
-            db.execute("DROP TABLE cover_change_alerts")
             db.execute("DROP TABLE deliveries")
             db.execute("DROP TABLE subscribers")
             db.execute("ALTER TABLE reminders DROP COLUMN audience_captured")
@@ -448,17 +407,58 @@ class StateTests(unittest.TestCase):
             db.execute("DELETE FROM settings WHERE key='monitor_identity'")
         self.store = Store(self.path)
 
-    def test_version_two_database_adds_change_alert_tables(self):
+    def test_version_two_database_upgrades_without_change_alert_tables(self):
         self.store.close()
         with sqlite3.connect(self.path) as db:
-            db.execute("DROP TABLE cover_change_deliveries")
-            db.execute("DROP TABLE cover_change_alerts")
             db.execute("PRAGMA user_version=2")
         self.store = Store(self.path)
-        self.assertEqual(self.store.db.execute("PRAGMA user_version").fetchone()[0], 3)
-        self.assertIsNotNone(self.store.db.execute(
+        self.assertEqual(self.store.db.execute("PRAGMA user_version").fetchone()[0], 4)
+        self.assertIsNone(self.store.db.execute(
             "SELECT name FROM sqlite_master WHERE name='cover_change_alerts'"
         ).fetchone())
+
+    def test_version_three_database_suppresses_pending_change_alerts(self):
+        with self.store.db:
+            self.store.db.executescript("""
+                CREATE TABLE cover_change_alerts (
+                    media_id TEXT PRIMARY KEY REFERENCES reels(media_id),
+                    status TEXT NOT NULL CHECK(status IN ('pending', 'sent', 'superseded')),
+                    audience_captured INTEGER NOT NULL DEFAULT 0 CHECK(audience_captured IN (0, 1)),
+                    detected_at REAL NOT NULL
+                );
+                CREATE TABLE cover_change_deliveries (
+                    media_id TEXT NOT NULL REFERENCES cover_change_alerts(media_id),
+                    chat_id INTEGER NOT NULL REFERENCES subscribers(chat_id),
+                    status TEXT NOT NULL CHECK(status IN ('pending', 'sent', 'cancelled')),
+                    message_id INTEGER,
+                    sent_at REAL,
+                    PRIMARY KEY (media_id, chat_id)
+                );
+                INSERT INTO reels (media_id, permalink, published_at, first_seen_at, status)
+                    VALUES ('historical-reel', '', 0, 0, 'changed');
+                INSERT INTO cover_change_alerts VALUES ('local-reel', 'pending', 1, 3600);
+                INSERT INTO cover_change_alerts VALUES ('historical-reel', 'sent', 1, 1800);
+                INSERT INTO cover_change_deliveries VALUES ('local-reel', 101, 'pending', NULL, NULL);
+                INSERT INTO cover_change_deliveries VALUES ('historical-reel', 101, 'sent', 17, 1801);
+            """)
+        self.store.close()
+        with sqlite3.connect(self.path) as db:
+            db.execute("PRAGMA user_version=3")
+        self.store = Store(self.path)
+        self.assertEqual(self.store.db.execute("PRAGMA user_version").fetchone()[0], 4)
+        self.assertEqual(self.store.db.execute(
+            "SELECT status FROM cover_change_alerts WHERE media_id='local-reel'"
+        ).fetchone()[0], "superseded")
+        self.assertEqual(self.store.db.execute(
+            "SELECT status FROM cover_change_deliveries WHERE media_id='local-reel' AND chat_id=101"
+        ).fetchone()[0], "cancelled")
+        self.assertEqual(self.store.db.execute(
+            "SELECT status FROM cover_change_alerts WHERE media_id='historical-reel'"
+        ).fetchone()[0], "sent")
+        self.assertEqual(self.store.db.execute(
+            "SELECT status FROM cover_change_deliveries WHERE media_id='historical-reel' AND chat_id=101"
+        ).fetchone()[0], "sent")
+        self.assertNotIn("cover_change_alerts", self.store.summary())
 
     def test_update_failure_preserves_offset_and_reports_unhealthy(self):
         config = Config("", "", "me", "20260819_00", "", self.path, "")
