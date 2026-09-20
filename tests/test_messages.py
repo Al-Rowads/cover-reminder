@@ -30,6 +30,14 @@ class MessageTests(unittest.TestCase):
             "نشده است. لطفاً کاور را بررسی کنید.\n\nhttps://www.instagram.com/",
         )
 
+    def test_47_hour_reminder_uses_persian_numerals_and_is_not_final(self):
+        permalink = "https://www.instagram.com/"
+        self.assertEqual(
+            reminder_message(47, permalink),
+            "بررسی کاور: از انتشار این ریلز دست‌کم ۴۷ ساعت گذشته است و تغییری در کاور آن تشخیص داده "
+            "نشده است. لطفاً کاور را بررسی کنید.\n\nhttps://www.instagram.com/",
+        )
+
     def test_48_hour_reminder_marks_the_final_notification(self):
         permalink = "https://www.instagram.com/"
         self.assertEqual(

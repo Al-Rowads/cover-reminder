@@ -43,19 +43,22 @@ class StateTests(unittest.TestCase):
     def due(self, hours):
         return self.store.queue_due(self.reel.media_id, hours * HOUR)
 
-    def test_reminders_start_at_24_hours_and_finish_at_48(self):
+    def test_reminders_run_at_24_47_and_48_hours(self):
         self.observe(24 - 1 / HOUR)
         self.assertIsNone(self.due(24 - 1 / HOUR))
         self.observe(24)
         self.assertEqual(self.due(24), 24)
         self.store.sent(self.reel.media_id, 24, 101, 1, 24 * HOUR)
+        self.observe(47 - 1 / HOUR)
+        self.assertIsNone(self.due(47 - 1 / HOUR))
         self.observe(47)
-        self.assertIsNone(self.due(47))
+        self.assertEqual(self.due(47), 47)
+        self.store.sent(self.reel.media_id, 47, 101, 2, 47 * HOUR)
         self.observe(48)
         self.assertEqual(self.due(48), 48)
-        self.store.sent(self.reel.media_id, 48, 101, 2, 48 * HOUR)
+        self.store.sent(self.reel.media_id, 48, 101, 3, 48 * HOUR)
         self.assertEqual(self.store.pending(), [])
-        self.assertEqual(self.store.summary()["reminders"], {"sent": 2})
+        self.assertEqual(self.store.summary()["reminders"], {"sent": 3})
         self.assertIsNone(self.due(72))
 
     def test_restart_preserves_sent_reminder_and_baseline(self):
@@ -81,6 +84,18 @@ class StateTests(unittest.TestCase):
         self.assertEqual(len(self.store.pending_reminders_for_delivery(25 * HOUR)), 1)
         self.assertEqual(self.store.summary()["reminders"], {"pending": 1})
 
+    def test_unsent_47_hour_reminder_requires_a_fresh_cover_check(self):
+        self.observe(24)
+        self.due(24)
+        self.store.sent(self.reel.media_id, 24, 101, 1, 24 * HOUR)
+        self.observe(47)
+        self.assertEqual(self.due(47), 47)
+        self.assertEqual(len(self.store.pending_reminders_for_delivery(47 * HOUR)), 1)
+        self.assertEqual(self.store.pending_reminders_for_delivery(47.5 * HOUR), [])
+        self.observe(47.5)
+        self.assertEqual(self.due(47.5), 47)
+        self.assertEqual(len(self.store.pending_reminders_for_delivery(47.5 * HOUR)), 1)
+
     def test_failed_cover_fetch_defers_due_reminder(self):
         self.observe(24)
         self.store.observation_failed(self.reel.media_id, "thumbnail:network_error")
@@ -88,7 +103,7 @@ class StateTests(unittest.TestCase):
         self.observe(25)
         self.assertEqual(self.due(25), 24)
 
-    def test_changed_cover_before_first_reminder_silently_cancels_both(self):
+    def test_changed_cover_before_first_reminder_silently_cancels_all(self):
         observation = self.observe(23, self.changed)
         self.assertEqual(observation["status"], "changed")
         self.assertEqual(self.store.reel(self.reel.media_id)["change_streak"], 1)
@@ -97,15 +112,27 @@ class StateTests(unittest.TestCase):
             "SELECT name FROM sqlite_master WHERE name='cover_change_alerts'"
         ).fetchone())
         self.assertIsNone(self.due(24))
+        self.assertIsNone(self.due(47))
         self.assertIsNone(self.due(48))
 
-    def test_changed_cover_after_first_reminder_cancels_second(self):
+    def test_changed_cover_after_first_reminder_cancels_later_reminders(self):
         self.observe(24)
         self.due(24)
         self.store.sent(self.reel.media_id, 24, 101, 1, 24 * HOUR)
         self.observe(25, self.changed)
         self.assertIsNone(self.due(48))
         self.assertEqual(self.store.summary()["reminders"], {"sent": 1})
+
+    def test_changed_cover_after_47_hour_reminder_cancels_final_reminder(self):
+        self.observe(24)
+        self.due(24)
+        self.store.sent(self.reel.media_id, 24, 101, 1, 24 * HOUR)
+        self.observe(47)
+        self.due(47)
+        self.store.sent(self.reel.media_id, 47, 101, 2, 47 * HOUR)
+        self.observe(47.5, self.changed)
+        self.assertIsNone(self.due(48))
+        self.assertEqual(self.store.summary()["reminders"], {"sent": 2})
 
     def test_below_threshold_variation_does_not_count_as_a_change(self):
         sample = bytes(round(before * 0.99 + after * 0.01)
@@ -125,12 +152,22 @@ class StateTests(unittest.TestCase):
         self.assertEqual(observation["status"], "changed")
         self.assertEqual(observation["change_streak"], 1)
 
-    def test_both_overdue_milestones_are_coalesced(self):
+    def test_overdue_milestones_are_coalesced(self):
         self.observe(24)
         self.due(24)
         self.observe(60)
         self.assertEqual(self.due(60), 48)
-        self.assertEqual(self.store.summary()["reminders"], {"pending": 1, "superseded": 1})
+        self.assertEqual(self.store.summary()["reminders"], {"pending": 1, "superseded": 2})
+
+    def test_47_hour_milestone_supersedes_an_unsent_24_hour_delivery(self):
+        self.store.apply_update(2, 102, True)
+        self.observe(24)
+        self.due(24)
+        self.store.sent(self.reel.media_id, 24, 101, 1, 24 * HOUR)
+        self.observe(47)
+        self.assertEqual(self.due(47), 47)
+        self.assertEqual(self.store.pending_deliveries(self.reel.media_id, 24), [])
+        self.assertEqual(self.store.pending_deliveries(self.reel.media_id, 47), [101, 102])
 
     def test_detected_change_wins_at_first_successful_check_after_final_deadline(self):
         observation = self.observe(60, self.changed)
@@ -295,6 +332,11 @@ class StateTests(unittest.TestCase):
         self.store.sent(self.reel.media_id, 24, 101, 1, 24 * HOUR)
         self.observe(25)
         self.assertIsNone(self.due(25))
+        self.observe(47)
+        self.due(47)
+        self.assertEqual(self.store.pending_deliveries(self.reel.media_id, 47), [101, 102])
+        self.store.sent(self.reel.media_id, 47, 101, 2, 47 * HOUR)
+        self.store.sent(self.reel.media_id, 47, 102, 2, 47 * HOUR)
         self.observe(48)
         self.due(48)
         self.assertEqual(self.store.pending_deliveries(self.reel.media_id, 48), [101, 102])
@@ -324,7 +366,7 @@ class StateTests(unittest.TestCase):
         self.observe(48)
         self.assertIsNone(self.due(48))
         self.assertEqual(self.store.pending(), [])
-        self.assertEqual(self.store.summary()["reminders"], {"superseded": 2})
+        self.assertEqual(self.store.summary()["reminders"], {"superseded": 3})
 
     def test_cover_change_cancels_only_unsent_recipients(self):
         self.store.apply_update(2, 102, True)
@@ -371,7 +413,7 @@ class StateTests(unittest.TestCase):
             db.execute("DELETE FROM settings WHERE key='telegram_recent_updates'")
             db.execute("PRAGMA user_version=1")
         self.store = Store(self.path)
-        self.assertEqual(self.store.db.execute("PRAGMA user_version").fetchone()[0], 4)
+        self.assertEqual(self.store.db.execute("PRAGMA user_version").fetchone()[0], 5)
         self.assertEqual(self.store.db.execute("PRAGMA foreign_key_check").fetchall(), [])
         self.store.activate(config, 25 * HOUR)
         self.assertEqual(self.store.subscribers(), [])
@@ -386,6 +428,65 @@ class StateTests(unittest.TestCase):
         self.observe(48)
         self.assertEqual(self.due(48), 48)
         self.assertEqual(self.store.pending_deliveries(self.reel.media_id, 48), [102])
+
+    def test_version_four_migration_preserves_deliveries_and_accepts_47_hours(self):
+        self.observe(24)
+        self.due(24)
+        self.store.sent(self.reel.media_id, 24, 101, 7, 24 * HOUR)
+        with self.store.db:
+            self.store.db.execute(
+                "UPDATE reminders SET message_id=7, sent_at=? WHERE media_id=? AND hours=24",
+                (24 * HOUR, self.reel.media_id),
+            )
+        self.store.close()
+        with sqlite3.connect(self.path) as db:
+            db.executescript("""
+                CREATE TABLE reminders_v4 (
+                    media_id TEXT NOT NULL REFERENCES reels(media_id),
+                    hours INTEGER NOT NULL CHECK(hours IN (24, 48)),
+                    status TEXT NOT NULL CHECK(status IN ('pending', 'sent', 'superseded')),
+                    message_id INTEGER,
+                    sent_at REAL,
+                    audience_captured INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (media_id, hours)
+                );
+                CREATE TABLE deliveries_v4 (
+                    media_id TEXT NOT NULL,
+                    hours INTEGER NOT NULL,
+                    chat_id INTEGER NOT NULL REFERENCES subscribers(chat_id),
+                    status TEXT NOT NULL CHECK(status IN ('pending', 'sent', 'cancelled')),
+                    message_id INTEGER,
+                    sent_at REAL,
+                    PRIMARY KEY (media_id, hours, chat_id),
+                    FOREIGN KEY (media_id, hours) REFERENCES reminders_v4(media_id, hours)
+                );
+                INSERT INTO reminders_v4 SELECT * FROM reminders;
+                INSERT INTO deliveries_v4 SELECT * FROM deliveries;
+                DROP TABLE deliveries;
+                DROP TABLE reminders;
+                ALTER TABLE reminders_v4 RENAME TO reminders;
+                ALTER TABLE deliveries_v4 RENAME TO deliveries;
+                PRAGMA user_version=4;
+            """)
+        self.store = Store(self.path)
+        self.assertEqual(self.store.db.execute("PRAGMA user_version").fetchone()[0], 5)
+        self.assertEqual(self.store.db.execute("PRAGMA foreign_key_check").fetchall(), [])
+        self.assertEqual(
+            tuple(self.store.db.execute(
+                "SELECT status, message_id, sent_at FROM reminders WHERE media_id=? AND hours=24",
+                (self.reel.media_id,),
+            ).fetchone()),
+            ("sent", 7, 24 * HOUR),
+        )
+        self.assertEqual(
+            tuple(self.store.db.execute(
+                "SELECT status, message_id, sent_at FROM deliveries WHERE media_id=? AND hours=24",
+                (self.reel.media_id,),
+            ).fetchone()),
+            ("sent", 7, 24 * HOUR),
+        )
+        self.observe(47)
+        self.assertEqual(self.due(47), 47)
 
     def test_failed_migration_rolls_back_schema_changes(self):
         self.store.close()
@@ -412,7 +513,7 @@ class StateTests(unittest.TestCase):
         with sqlite3.connect(self.path) as db:
             db.execute("PRAGMA user_version=2")
         self.store = Store(self.path)
-        self.assertEqual(self.store.db.execute("PRAGMA user_version").fetchone()[0], 4)
+        self.assertEqual(self.store.db.execute("PRAGMA user_version").fetchone()[0], 5)
         self.assertIsNone(self.store.db.execute(
             "SELECT name FROM sqlite_master WHERE name='cover_change_alerts'"
         ).fetchone())
@@ -445,7 +546,7 @@ class StateTests(unittest.TestCase):
         with sqlite3.connect(self.path) as db:
             db.execute("PRAGMA user_version=3")
         self.store = Store(self.path)
-        self.assertEqual(self.store.db.execute("PRAGMA user_version").fetchone()[0], 4)
+        self.assertEqual(self.store.db.execute("PRAGMA user_version").fetchone()[0], 5)
         self.assertEqual(self.store.db.execute(
             "SELECT status FROM cover_change_alerts WHERE media_id='local-reel'"
         ).fetchone()[0], "superseded")

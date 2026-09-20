@@ -1,7 +1,7 @@
 # Cover Reminder
 
 Checks one Instagram account's **Reels every hour**, using its existing Composio
-connection. Sends Persian Telegram reminders **24 hours and 48 hours after publication**
+connection. Sends Persian Telegram reminders **24, 47, and 48 hours after publication**
 when no cover change has been detected. A detected change silently cancels the
 remaining reminders. The 48-hour check is final. Reminders go to every active
 private-chat subscriber who has sent `/start` to the bot. No configured chat ID is
@@ -18,8 +18,9 @@ needed. Send `/stop` to unsubscribe.
   normally within an hour. Outages and rate limits can delay delivery.
 - Missing/unreadable thumbnails and API errors never count as unchanged covers.
   The service defers delivery until it can check the current cover successfully.
-- After an outage that spans both deadlines, the first successful check sends the
-  48-hour reminder only if the cover is still unchanged.
+- After an outage that spans multiple deadlines, the first successful check sends
+  only the latest due reminder if the cover is still unchanged. At or after 48 hours,
+  that is the final reminder.
 - Only Reels published after the **first successful activation** are eligible.
   Restarts preserve that activation time, post state, and the polling schedule.
 - Each reminder takes a snapshot of active subscribers when it is first queued.
@@ -96,7 +97,7 @@ or shortly before `send-test`.
 | `COVER_DIFFERENCE_THRESHOLD` | Fraction between 0 and 1; default `0.05` |
 | `DATABASE_PATH` | `/data/reminders.sqlite3` in Docker; `data/reminders.sqlite3` by default locally |
 
-Polling is fixed at one hour, and milestones are fixed at 24/48 hours. There are
+Polling is fixed at one hour, and milestones are fixed at 24/47/48 hours. There are
 about 720 discovery requests per 30 days for a single-page account, plus additional
 pages, pending-Reel lookups, and retries. Composio usage and server hosting may incur
 charges according to your existing plans.
@@ -110,9 +111,9 @@ charges according to your existing plans.
   repeated for that recipient after restart. If Telegram accepts a message but the response is lost,
   a retry can produce a duplicate; the Bot API has no send idempotency key.
 - Temporary HTTP failures receive up to three attempts with backoff. Long
-  `Retry-After` delays are stored across restarts and respected. Unsent 24-hour
-  reminders are rechecked against the current cover; final reminders retry from
-  their durable recipient snapshots.
+  `Retry-After` delays are stored across restarts and respected. Unsent 24- and
+  47-hour reminders are rechecked against the current cover; final reminders retry
+  from their durable recipient snapshots.
 - Sends are paced to at most 20 per second overall and one per second per chat;
   Telegram retry delays take precedence. Paid broadcasts are not enabled.
 - `status` shows post, reminder, subscriber, and per-recipient delivery counts,
@@ -137,11 +138,14 @@ charges according to your existing plans.
 ### Upgrading an existing database
 
 Stop the worker and back up its data volume before deploying this version. The
-first database open migrates schema versions 1, 2, or 3 to 4 transactionally,
+first database open migrates schema versions 1, 2, 3, or 4 to 5 transactionally,
 preserving activation, Reel state, polling schedule, subscribers, and historical
 reminder sends. Stored cover-verification evidence and old capture files are ignored
 and are not deleted. When upgrading from version 3, queued cover-change messages
 are cancelled and cannot be delivered; completed historical records are retained.
+Pending Reels adopt the new schedule immediately: a successful check from 47 hours
+up to the final deadline queues the 47-hour reminder, while a check at or after
+48 hours queues only the final reminder.
 
 When upgrading directly from schema version 1, the previous destination is not
 automatically subscribed. Remove `TELEGRAM_CHAT_ID` from `.env` and have recipients
@@ -149,7 +153,7 @@ send `/start` again; an old environment value is ignored. Previously sent milest
 are not replayed. A legacy pending milestone captures active subscribers after its
 next successful cover check.
 
-Older applications cannot open a version 4 database. To roll back, stop the worker
+Older applications cannot open a version 5 database. To roll back, stop the worker
 and restore the pre-upgrade backup with the previous application version.
 
 ## Local development and validation
@@ -183,7 +187,7 @@ RUN_LIVE_TESTS=1 .venv/bin/python -m unittest discover -s tests -p test_live.py 
 
 Live acceptance requires: successful `check`; two private users sending `/start`
 and both receiving `send-test`; `/stop` excluding one user from subsequent tests;
-an unchanged Reel delivering both reminders without repeating recorded deliveries
+an unchanged Reel delivering all three reminders without repeating recorded deliveries
 after restart; and an edited Reel silently cancelling applicable remaining reminders.
 Also verify that blocking the bot removes that recipient and group commands do not
 subscribe a group. Do not claim those checks passed based on the offline suite.

@@ -5,7 +5,7 @@ from threading import Event
 from .api import Http, Instagram, ServiceError, Telegram
 from .config import POLL_SECONDS, Config, ConfigurationError
 from .images import normalize_image
-from .storage import Store
+from .storage import FINAL_REMINDER_HOURS, Store
 from .subscriptions import subscription_change
 
 logger = logging.getLogger(__name__)
@@ -15,11 +15,11 @@ UNSUBSCRIBED_MESSAGE = (
     "عضویت شما در یادآوری‌های کاور لغو شد. برای عضویت دوباره، دستور /start را ارسال کنید."
 )
 TEST_MESSAGE = "یادآور کاور: پیام آزمایشی تلگرام با موفقیت ارسال شد."
-PERSIAN_HOURS = {24: "۲۴", 48: "۴۸"}
+PERSIAN_HOURS = {24: "۲۴", 47: "۴۷", 48: "۴۸"}
 
 
 def reminder_message(hours: int, permalink: str) -> str:
-    final = " این آخرین یادآوری است." if hours == 48 else ""
+    final = " این آخرین یادآوری است." if hours == FINAL_REMINDER_HOURS else ""
     return (
         f"بررسی کاور: از انتشار این ریلز دست‌کم {PERSIAN_HOURS[hours]} ساعت گذشته است و تغییری "
         f"در کاور آن تشخیص داده نشده است. لطفاً کاور را بررسی کنید.{final}\n\n{permalink}"

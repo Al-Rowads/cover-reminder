@@ -11,6 +11,11 @@ from .images import difference
 from .model import Reel
 
 
+SCHEMA_VERSION = 5
+REMINDER_HOURS = (24, 47, 48)
+FINAL_REMINDER_HOURS = REMINDER_HOURS[-1]
+
+
 @contextmanager
 def exclusive_worker(path: Path):
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -32,7 +37,7 @@ class Store:
         os.chmod(path, 0o600)
         self.db.row_factory = sqlite3.Row
         version = self.db.execute("PRAGMA user_version").fetchone()[0]
-        if version not in {0, 1, 2, 3, 4}:
+        if version not in range(SCHEMA_VERSION + 1):
             self.db.close()
             raise ConfigurationError("Database schema is newer than this application")
         self.db.execute("PRAGMA foreign_keys=ON")
@@ -64,7 +69,7 @@ class Store:
             );
             CREATE TABLE IF NOT EXISTS reminders (
                 media_id TEXT NOT NULL REFERENCES reels(media_id),
-                hours INTEGER NOT NULL CHECK(hours IN (24, 48)),
+                hours INTEGER NOT NULL CHECK(hours IN (24, 47, 48)),
                 status TEXT NOT NULL CHECK(status IN ('pending', 'sent', 'superseded')),
                 message_id INTEGER,
                 sent_at REAL,
@@ -89,7 +94,7 @@ class Store:
         """)
         # Another connection may have migrated while this connection waited for the write lock.
         version = self.db.execute("PRAGMA user_version").fetchone()[0]
-        if version not in {0, 1, 2, 3, 4}:
+        if version not in range(SCHEMA_VERSION + 1):
             raise ConfigurationError("Database schema is newer than this application")
         if version < 2:
             self.db.execute("ALTER TABLE reminders ADD COLUMN audience_captured INTEGER NOT NULL DEFAULT 0")
@@ -104,8 +109,61 @@ class Store:
             self.db.execute(
                 "UPDATE cover_change_alerts SET status='superseded' WHERE status='pending'"
             )
-        self.db.execute("PRAGMA user_version=4")
+        if version < 5:
+            self._migrate_reminder_hours()
+        self.db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         self.db.commit()
+
+    def _migrate_reminder_hours(self) -> None:
+        # SQLite cannot widen a CHECK constraint in place. Rebuild both related
+        # tables so their composite foreign key remains valid throughout the migration.
+        self.db.execute("""
+            CREATE TABLE reminders_v5 (
+                media_id TEXT NOT NULL REFERENCES reels(media_id),
+                hours INTEGER NOT NULL CHECK(hours IN (24, 47, 48)),
+                status TEXT NOT NULL CHECK(status IN ('pending', 'sent', 'superseded')),
+                message_id INTEGER,
+                sent_at REAL,
+                audience_captured INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (media_id, hours)
+            )
+        """)
+        self.db.execute("""
+            CREATE TABLE deliveries_v5 (
+                media_id TEXT NOT NULL,
+                hours INTEGER NOT NULL,
+                chat_id INTEGER NOT NULL REFERENCES subscribers(chat_id),
+                status TEXT NOT NULL CHECK(status IN ('pending', 'sent', 'cancelled')),
+                message_id INTEGER,
+                sent_at REAL,
+                PRIMARY KEY (media_id, hours, chat_id),
+                FOREIGN KEY (media_id, hours) REFERENCES reminders_v5(media_id, hours)
+            )
+        """)
+        self.db.execute("""
+            INSERT INTO reminders_v5
+                (media_id, hours, status, message_id, sent_at, audience_captured)
+            SELECT media_id, hours, status, message_id, sent_at, audience_captured
+            FROM reminders
+        """)
+        self.db.execute("""
+            INSERT INTO deliveries_v5
+                (media_id, hours, chat_id, status, message_id, sent_at)
+            SELECT media_id, hours, chat_id, status, message_id, sent_at
+            FROM deliveries
+        """)
+        self.db.execute("DROP TABLE deliveries")
+        self.db.execute("DROP TABLE reminders")
+        self.db.execute("ALTER TABLE reminders_v5 RENAME TO reminders")
+        self.db.execute("ALTER TABLE deliveries_v5 RENAME TO deliveries")
+        self.db.execute(
+            "CREATE INDEX deliveries_by_status ON deliveries(media_id, hours, status)"
+        )
+        self.db.execute(
+            "CREATE INDEX deliveries_by_subscriber ON deliveries(chat_id, status)"
+        )
+        if self.db.execute("PRAGMA foreign_key_check").fetchone() is not None:
+            raise ConfigurationError("Database migration would violate foreign keys")
 
     def close(self) -> None:
         self.db.close()
@@ -240,24 +298,30 @@ class Store:
 
     def queue_due(self, media_id: str, now: float) -> int | None:
         row = self.reel(media_id)
-        # A 24-hour delivery must be revalidated against a fresh cover on every retry.
+        # Non-final deliveries must be revalidated against a fresh cover on every retry.
         if (row["status"] != "pending" or row["last_checked_at"] != now
                 or row["last_error"] or row["baseline"] is None or row["change_streak"]):
             return None
         age = now - row["published_at"]
-        hours = 48 if age >= 48 * 3600 else 24 if age >= 24 * 3600 else None
+        hours = next(
+            (milestone for milestone in reversed(REMINDER_HOURS) if age >= milestone * 3600),
+            None,
+        )
         if hours is None:
             return None
         with self.db:
-            if hours == 48:
+            for earlier_hours in REMINDER_HOURS:
+                if earlier_hours >= hours:
+                    break
                 self.db.execute("""
-                    UPDATE deliveries SET status='cancelled' WHERE media_id=? AND hours=24 AND status='pending'
-                """, (media_id,))
+                    UPDATE deliveries SET status='cancelled'
+                    WHERE media_id=? AND hours=? AND status='pending'
+                """, (media_id, earlier_hours))
                 self.db.execute("""
-                    INSERT INTO reminders (media_id, hours, status) VALUES (?, 24, 'superseded')
+                    INSERT INTO reminders (media_id, hours, status) VALUES (?, ?, 'superseded')
                     ON CONFLICT(media_id, hours) DO UPDATE SET status='superseded'
                     WHERE reminders.status='pending'
-                """, (media_id,))
+                """, (media_id, earlier_hours))
             self.db.execute(
                 "INSERT OR IGNORE INTO reminders (media_id, hours, status) VALUES (?, ?, 'pending')",
                 (media_id, hours),
@@ -272,7 +336,7 @@ class Store:
                     SELECT ?, ?, chat_id, 'pending' FROM subscribers WHERE active=1
                 """, (media_id, hours))
                 self._finish_reminder(media_id, hours)
-            if hours == 48:
+            if hours == FINAL_REMINDER_HOURS:
                 self.db.execute(
                     "UPDATE reels SET status='completed' WHERE media_id=? AND status='pending'", (media_id,)
                 )
@@ -294,14 +358,14 @@ class Store:
             SELECT reminders.media_id, reminders.hours, reels.permalink
             FROM reminders JOIN reels USING(media_id)
             WHERE reminders.status='pending' AND (
-                reminders.hours=48 OR (
-                    reminders.hours=24 AND reels.status='pending'
+                reminders.hours=? OR (
+                    reminders.hours<? AND reels.status='pending'
                     AND reels.last_checked_at=? AND reels.last_error IS NULL
                     AND reels.baseline IS NOT NULL AND reels.change_streak=0
                 )
             )
             ORDER BY reels.published_at, reminders.media_id
-        """, (now,)).fetchall()
+        """, (FINAL_REMINDER_HOURS, FINAL_REMINDER_HOURS, now)).fetchall()
 
     def delivery_pending(self, media_id: str, hours: int, chat_id: int) -> bool:
         return self.db.execute("""
@@ -329,7 +393,7 @@ class Store:
         self.db.execute("""
             UPDATE reminders SET status=? WHERE media_id=? AND hours=? AND status='pending'
         """, ("sent" if sent else "superseded", media_id, hours))
-        if hours == 48:
+        if hours == FINAL_REMINDER_HOURS:
             self.db.execute("UPDATE reels SET status='completed' WHERE media_id=? AND status='pending'", (media_id,))
 
     def summary(self) -> dict:
